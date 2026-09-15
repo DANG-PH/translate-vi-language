@@ -241,16 +241,36 @@ class GoogleSegmentLengthTests(unittest.TestCase):
             translator.do_translate("a" * 5001)
 
     def test_a_segment_at_the_limit_is_still_sent(self):
+        # Google failing now falls through to MyMemory (see
+        # GoogleTranslator.do_translate's circuit breaker) rather than
+        # raising straight out of do_translate, so this fakes both calls:
+        # Google records what it was sent and fails, MyMemory returns a
+        # minimal valid response so do_translate completes normally. The
+        # actual thing under test is unchanged — Google gets the full
+        # 5000 characters, not a truncated segment.
         translator = GoogleTranslator("en", "vi")
         sent = {}
 
-        def fake_get(endpoint, params, headers, timeout):
-            sent["q"] = params["q"]
-            raise RuntimeError("stop before the network")
+        class FakeMyMemoryResponse:
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "responseStatus": "200",
+                    "responseData": {"translatedText": "ok"},
+                }
+
+        def fake_get(endpoint, params, headers=None, timeout=None):
+            if endpoint == translator.endpoint:
+                sent["q"] = params["q"]
+                raise RuntimeError("stop before the network")
+            return FakeMyMemoryResponse()
 
         translator.session.get = fake_get
-        with self.assertRaises(RuntimeError):
-            translator.do_translate("a" * 5000)
+        translator.do_translate("a" * 5000)
         self.assertEqual(len(sent["q"]), 5000)
 
 

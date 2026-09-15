@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 import json
 import logging
+import os
 import re
 import threading
 import unicodedata
@@ -177,10 +178,34 @@ class BaseTranslator:
 
 
 class GoogleTranslator(BaseTranslator):
-    """Translate through Google's mobile web endpoint without an API key."""
+    """Translate through Google's mobile web endpoint, falling back to
+    MyMemory when Google's abuse detection blocks the request.
+
+    Datacenter/VPS IPs get a 429 + CAPTCHA page from Google's endpoint
+    consistently, not intermittently — confirmed directly (both this
+    endpoint and the alternate translate.googleapis.com?client=gtx one,
+    from the same network, every single attempt). Retrying a proven-dead
+    endpoint 8 times per segment (see converter.py's request_translation)
+    just burns the whole timeout budget for nothing, so this trips a
+    circuit breaker after the first failure and goes straight to MyMemory
+    for the rest of the run instead of repeating a doomed request
+    thousands of times over. Same resilience pattern already proven in
+    production elsewhere (a sibling project's translate.util.ts).
+    """
 
     name = "google"
     lang_map: ClassVar[dict[str, str]] = {"zh": "zh-CN"}
+
+    # The /m endpoint carries the text in the query string and rejects more
+    # than this; it is the service's limit, not a preference.
+    MAXIMUM_SEGMENT_CHARACTERS = 5000
+
+    # MyMemory's free tier is quota-limited per day (much lower than
+    # Google's), so it's a fallback for when Google is unreachable, not a
+    # replacement primary — see do_translate(). MYMEMORY_EMAIL raises the
+    # daily quota (MyMemory doesn't verify it, just uses it to key the
+    # quota bucket); unset falls back to a fixed placeholder address.
+    MYMEMORY_ENDPOINT = "https://api.mymemory.translated.net/get"
 
     def __init__(
         self,
@@ -206,10 +231,10 @@ class GoogleTranslator(BaseTranslator):
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
             )
         }
-
-    # The /m endpoint carries the text in the query string and rejects more
-    # than this; it is the service's limit, not a preference.
-    MAXIMUM_SEGMENT_CHARACTERS = 5000
+        # circuit breaker: once Google fails once this run, every
+        # subsequent segment skips straight to MyMemory instead of
+        # re-discovering the same block one request at a time
+        self._google_dead = False
 
     def do_translate(self, text: str) -> str:
         if len(text) > self.MAXIMUM_SEGMENT_CHARACTERS:
@@ -217,6 +242,19 @@ class GoogleTranslator(BaseTranslator):
                 f"segment of {len(text)} characters exceeds the "
                 f"{self.MAXIMUM_SEGMENT_CHARACTERS} the service accepts"
             )
+        if not self._google_dead:
+            try:
+                return self._translate_via_google(text)
+            except Exception as err:  # noqa: BLE001 — any failure here means "try the fallback", not "propagate"
+                logger.warning(
+                    "Google Translate unavailable (%s: %s) — switching to MyMemory for the rest of this run",
+                    type(err).__name__,
+                    err,
+                )
+                self._google_dead = True
+        return self._translate_via_mymemory(text)
+
+    def _translate_via_google(self, text: str) -> str:
         response = self.session.get(
             self.endpoint,
             params={"tl": self.lang_out, "sl": self.lang_in, "q": text},
@@ -233,6 +271,36 @@ class GoogleTranslator(BaseTranslator):
         if match is None:
             raise RuntimeError("Google Translate response did not contain a translation result")
         return remove_control_characters(html.unescape(match.group(1)))
+
+    def _translate_via_mymemory(self, text: str) -> str:
+        # MyMemory needs an explicit source language, not "auto" — every
+        # book this app handles is an English technical book, so that's
+        # the only realistic source in practice
+        source = self.lang_in if self.lang_in != "auto" else "en"
+        response = self.session.get(
+            self.MYMEMORY_ENDPOINT,
+            params={
+                "langpair": f"{source}|{self.lang_out}",
+                "q": text,
+                # MyMemory rejects a bare single-label host ("@local") as
+                # an invalid email (confirmed directly — a 2-label one
+                # like this passes fine) but never actually verifies
+                # deliverability, so any placeholder shaped like a real
+                # address works; only matters for which quota bucket
+                # this keys into, not who receives anything
+                "de": os.environ.get("MYMEMORY_EMAIL", "pdf-translator@techbooks.local"),
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+        data = response.json()
+        status = data.get("responseStatus")
+        translated = (data.get("responseData") or {}).get("translatedText") or ""
+        if data.get("quotaFinished"):
+            raise RuntimeError("MyMemory daily quota exhausted")
+        if str(status) != "200" or not translated:
+            raise RuntimeError(f"MyMemory translation failed (status {status})")
+        return remove_control_characters(html.unescape(translated))
 
 
 def placeholders(text: str) -> list[str]:
