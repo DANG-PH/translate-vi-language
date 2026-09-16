@@ -58,6 +58,7 @@ class Translation(NamedTuple):
 
     path: Path | None
     untranslated: int = 0
+    total_segments: int = 0
     reasons: Mapping[str, int] = MappingProxyType({})
     image_only_pages: tuple[int, ...] = ()
     ocr_pages: tuple[int, ...] = ()
@@ -485,6 +486,7 @@ def translate_pdf(
             return Translation(
                 None,
                 untranslated,
+                report.translatable_segments,
                 report.reasons,
                 image_only,
                 ocr_pages,
@@ -526,6 +528,7 @@ def translate_pdf(
     return Translation(
         destination,
         untranslated,
+        report.translatable_segments,
         report.reasons,
         image_only,
         ocr_pages,
@@ -592,6 +595,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # translation actually happen" from the presence/wording of warnings
     # above, which only appear when there's something to report
     print(f"Untranslated segments: {result.untranslated}")
+    print(f"Total segments: {result.total_segments}")
     if args.emit_segments is not None:
         emitted = args.emit_segments.expanduser().resolve()
         pending = sum(1 for line in emitted.open(encoding="utf-8") if line.strip())
