@@ -586,6 +586,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     for line in _describe_failures(result.reasons):
         print(f"warning: {line}", file=sys.stderr)
+    # always printed, not just when non-zero — a caller scripting this
+    # (see tech-books-backend's pdf-translator/server.py) needs a single,
+    # reliably-present line to check rather than having to infer "did
+    # translation actually happen" from the presence/wording of warnings
+    # above, which only appear when there's something to report
+    print(f"Untranslated segments: {result.untranslated}")
     if args.emit_segments is not None:
         emitted = args.emit_segments.expanduser().resolve()
         pending = sum(1 for line in emitted.open(encoding="utf-8") if line.strip())
