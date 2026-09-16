@@ -37,6 +37,14 @@ class FormulaPlaceholderError(ValueError):
     """Raised when a translator damages or reorders protected formula tags."""
 
 
+class AllTranslatorsDeadError(RuntimeError):
+    """Raised once every translation backend has failed at least once this run.
+
+    Deliberately its own type so converter.py's retry wrapper can recognise
+    it and stop retrying immediately — see GoogleTranslator.do_translate().
+    """
+
+
 class SegmentTooLongError(ValueError):
     """Raised when a segment exceeds what the translation service accepts.
 
@@ -191,6 +199,16 @@ class GoogleTranslator(BaseTranslator):
     for the rest of the run instead of repeating a doomed request
     thousands of times over. Same resilience pattern already proven in
     production elsewhere (a sibling project's translate.util.ts).
+
+    MyMemory gets the same treatment for the same reason: its free daily
+    quota turned out to be small enough that a real book exhausts it
+    mid-run (confirmed directly — 46/491 segments into a real translation),
+    and the 429 it returns at that point is a hard "not again until the
+    quota resets" for the rest of *today*, not a transient failure worth
+    re-discovering per segment either. Once both are confirmed dead, every
+    further segment in this run raises AllTranslatorsDeadError immediately
+    (see below) so converter.py's retry wrapper doesn't burn its own
+    8-attempt backoff schedule on a call that cannot possibly succeed.
     """
 
     name = "google"
@@ -231,16 +249,23 @@ class GoogleTranslator(BaseTranslator):
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
             )
         }
-        # circuit breaker: once Google fails once this run, every
-        # subsequent segment skips straight to MyMemory instead of
-        # re-discovering the same block one request at a time
+        # circuit breakers: once a backend fails once this run, every
+        # subsequent segment skips it entirely instead of re-discovering
+        # the same failure one request at a time
         self._google_dead = False
+        self._mymemory_dead = False
 
     def do_translate(self, text: str) -> str:
         if len(text) > self.MAXIMUM_SEGMENT_CHARACTERS:
             raise SegmentTooLongError(
                 f"segment of {len(text)} characters exceeds the "
                 f"{self.MAXIMUM_SEGMENT_CHARACTERS} the service accepts"
+            )
+        if self._google_dead and self._mymemory_dead:
+            # no network call at all — both already confirmed dead this
+            # run, nothing left to try
+            raise AllTranslatorsDeadError(
+                "Google and MyMemory have both already failed this run"
             )
         if not self._google_dead:
             try:
@@ -252,7 +277,21 @@ class GoogleTranslator(BaseTranslator):
                     err,
                 )
                 self._google_dead = True
-        return self._translate_via_mymemory(text)
+        if self._mymemory_dead:
+            raise AllTranslatorsDeadError(
+                "Google and MyMemory have both already failed this run"
+            )
+        try:
+            return self._translate_via_mymemory(text)
+        except Exception as err:  # noqa: BLE001 — same reasoning as the Google branch above
+            logger.warning(
+                "MyMemory unavailable (%s: %s) — every backend has failed, "
+                "giving up on machine translation for the rest of this run",
+                type(err).__name__,
+                err,
+            )
+            self._mymemory_dead = True
+            raise AllTranslatorsDeadError(str(err)) from err
 
     def _translate_via_google(self, text: str) -> str:
         response = self.session.get(

@@ -16,7 +16,7 @@ from pdfminer.pdffont import PDFCIDFont, PDFUnicodeNotDefined
 from pdfminer.pdfinterp import PDFGraphicState, PDFResourceManager
 from pdfminer.utils import apply_matrix_pt, mult_matrix
 from pymupdf import Font
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_not_exception_type, stop_after_attempt, wait_exponential
 
 from pdf2zh.rules import (
     is_bullet_character,
@@ -26,6 +26,7 @@ from pdf2zh.rules import (
 )
 from pdf2zh.translator import (
     ENGINES,
+    AllTranslatorsDeadError,
     BaseTranslator,
     encode_formula_placeholders,
     restore_formula_placeholders,
@@ -1191,9 +1192,18 @@ class TranslateConverter(PDFConverterEx):
         # Google throttles a long document, so back off instead of hammering it.
         # Roughly two minutes of patience per segment, then give up rather than
         # hang the run forever the way an unbounded retry used to.
+        #
+        # retry_if_not_exception_type(AllTranslatorsDeadError) — once
+        # GoogleTranslator's own circuit breakers have confirmed every
+        # backend dead for this run, retrying can't possibly help; without
+        # this exclusion every remaining segment would still pay the full
+        # 8-attempt backoff schedule (~3 minutes) for a call that returns
+        # instantly, turning a few-hundred-segment book into many hours of
+        # pure waiting on retries that were never going to succeed.
         @retry(
             wait=wait_exponential(multiplier=1, min=1, max=60),
             stop=stop_after_attempt(8),
+            retry=retry_if_not_exception_type(AllTranslatorsDeadError),
             reraise=True,
         )
         def request_translation(s: str) -> str:
