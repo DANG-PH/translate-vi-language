@@ -288,7 +288,10 @@ class GoogleTranslator(BaseTranslator):
                 # deliverability, so any placeholder shaped like a real
                 # address works; only matters for which quota bucket
                 # this keys into, not who receives anything
-                "de": os.environ.get("MYMEMORY_EMAIL", "pdf-translator@techbooks.local"),
+                # `or` rather than .get(..., default) — an env var set to
+                # an empty string (e.g. docker-compose substituting an
+                # unset .env value) must fall back too, not pass "" through
+                "de": os.environ.get("MYMEMORY_EMAIL") or "pdf-translator@techbooks.local",
             },
             timeout=20,
         )
